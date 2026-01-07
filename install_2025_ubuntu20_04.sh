@@ -16,7 +16,7 @@ read -p "请输入节点 ID: " node
 # --- 常量设置 ---
 SSR_HOME="/home/shadowsocksr"
 SSR_PANEL_PORT=44499
-SSR_TEDDYSUN_PORT=
+SSR_TEDDYSUN_PORT=443
 SSR_TEDDYSUN_PASS="teddysun.com"
 
 # --- 检查 root ---
@@ -37,6 +37,37 @@ pip3 install cymysql pycryptodome requests pynacl
 # 核心系统优化
 # ========================
 echo -e "\033[33m⚙️ 内核优化 + 高并发优化...\033[0m"
+
+# 检查并启用 BBR
+echo -e "\033[36m🚀 检查 BBR 支持...\033[0m"
+KERNEL_VERSION=$(uname -r | cut -d. -f1-2)
+KERNEL_MAJOR=$(echo $KERNEL_VERSION | cut -d. -f1)
+KERNEL_MINOR=$(echo $KERNEL_VERSION | cut -d. -f2)
+
+if [ "$KERNEL_MAJOR" -gt 4 ] || ([ "$KERNEL_MAJOR" -eq 4 ] && [ "$KERNEL_MINOR" -ge 9 ]); then
+    echo "✅ 内核版本 $KERNEL_VERSION 支持 BBR"
+    
+    # 启用 BBR
+    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    fi
+    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    fi
+    
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+    
+    # 验证 BBR 是否启用
+    if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
+        echo -e "\033[32m✅ BBR 加速已启用\033[0m"
+    else
+        echo -e "\033[33m⚠️ BBR 启用失败，请检查内核配置\033[0m"
+    fi
+else
+    echo -e "\033[33m⚠️ 内核版本 $KERNEL_VERSION 不支持 BBR（需要 4.9+）\033[0m"
+    echo -e "\033[33m💡 建议升级内核以获得更好的网络性能\033[0m"
+fi
 
 # 强制启用 nf_conntrack 并设置最大连接数
 if lsmod | grep -q '^nf_conntrack'; then sysctl -w net.netfilter.nf_conntrack_max=1048576 && echo "net.netfilter.nf_conntrack_max=1048576" >> /etc/sysctl.conf && sysctl -p; else echo "⚠️ nf_conntrack 模块不存在，跳过 nf_conntrack_max 设置"; fi
@@ -418,6 +449,13 @@ echo -e "\033[33m🔧 配置信息：\033[0m"
 echo "  节点 ID: $node"
 echo "  SSR Panel 端口: $SSR_PANEL_PORT"
 echo "  Teddysun SSR 端口: $SSR_TEDDYSUN_PORT"
+echo ""
+echo -e "\033[33m🚀 BBR 状态：\033[0m"
+if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
+    echo -e "  \033[32m✅ BBR 加速已启用\033[0m"
+else
+    echo -e "  \033[31m❌ BBR 未启用（内核版本过低或配置失败）\033[0m"
+fi
 echo ""
 echo -e "\033[36m🛡️ 智能守护已启用（自动重启 + 频率控制 + 冷却机制）\033[0m"
 echo ""
