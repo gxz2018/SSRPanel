@@ -1,461 +1,639 @@
 #!/bin/bash
-# =========================================================
-# 🚀 Ubuntu 20.04 SSRPanel + Teddysun SSR 高并发 + 智能守护部署
-# =========================================================
+#=================================================================#
+#   SSR + IP盾构机一键部署脚本                                     #
+#   适配 Ubuntu 24.04                                             #
+#   包含日志管理优化                                               #
+#=================================================================#
 
-set -e
-echo -e "\033[36m🔧 开始部署 SSRPanel + Teddysun SSR（高并发 + 智能守护版）...\033[0m"
+# 颜色定义
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+cyan='\033[0;36m'
+plain='\033[0m'
 
-# --- 用户输入 ---
-read -p "请输入前端 MySQL 地址: " mysqla
-read -p "请输入前端 MySQL 用户名: " mysqlu
-read -p "请输入前端 MySQL 密码: " mysqlp
-read -p "请输入前端 MySQL 数据库名: " mysqld
-read -p "请输入节点 ID: " node
-
-# --- 常量设置 ---
-SSR_HOME="/home/shadowsocksr"
-SSR_PANEL_PORT=44499
-SSR_TEDDYSUN_PORT=443
-SSR_TEDDYSUN_PASS="teddysun.com"
-
-# --- 检查 root ---
-if [[ "$EUID" -ne 0 ]]; then
-    echo "❌ 请以 root 用户执行"
+# 检测 sh/dash
+if readlink /proc/$$/exe | grep -q "dash"; then
+    echo -e "${red}请使用 bash 运行此脚本，不要使用 sh${plain}"
     exit 1
 fi
 
-# ========================
-# 系统更新 + 依赖
-# ========================
-apt update -y
-apt install -y git python3 python3-pip build-essential net-tools iptables curl libffi-dev libsodium-dev openssl supervisor wget unzip
-pip3 install --upgrade pip
-pip3 install cymysql pycryptodome requests pynacl
+# 检查 root 权限
+if [[ "$EUID" -ne 0 ]]; then
+    echo -e "${red}错误: 必须使用 root 用户运行此脚本!${plain}"
+    exit 1
+fi
 
-# ========================
-# 核心系统优化
-# ========================
-echo -e "\033[33m⚙️ 内核优化 + 高并发优化...\033[0m"
-
-# 检查并启用 BBR
-echo -e "\033[36m🚀 检查 BBR 支持...\033[0m"
-KERNEL_VERSION=$(uname -r | cut -d. -f1-2)
-KERNEL_MAJOR=$(echo $KERNEL_VERSION | cut -d. -f1)
-KERNEL_MINOR=$(echo $KERNEL_VERSION | cut -d. -f2)
-
-if [ "$KERNEL_MAJOR" -gt 4 ] || ([ "$KERNEL_MAJOR" -eq 4 ] && [ "$KERNEL_MINOR" -ge 9 ]); then
-    echo "✅ 内核版本 $KERNEL_VERSION 支持 BBR"
-    
-    # 启用 BBR
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+# 检查系统
+check_system(){
+    if grep -qs "14.04\|16.04\|18.04" /etc/os-release; then
+        echo -e "${red}不支持 Ubuntu 18.04 及以下版本，请使用 20.04+${plain}"
+        exit 1
     fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    if grep -qs "jessie" /etc/os-release; then
+        echo -e "${red}不支持 Debian 8${plain}"
+        exit 1
     fi
-    
-    sysctl -w net.core.default_qdisc=fq
-    sysctl -w net.ipv4.tcp_congestion_control=bbr
-    
-    # 验证 BBR 是否启用
-    if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-        echo -e "\033[32m✅ BBR 加速已启用\033[0m"
+    if grep -qs "CentOS release 6" /etc/redhat-release 2>/dev/null; then
+        echo -e "${red}不支持 CentOS 6${plain}"
+        exit 1
+    fi
+}
+
+# 显示主菜单
+show_menu(){
+    check_system
+    clear
+    echo -e "${cyan}"
+    echo "============================================================"
+    echo "  SSR + IP盾构机 一键部署脚本"
+    echo "  适配 Ubuntu 24.04"
+    echo "============================================================"
+    echo -e "${plain}"
+    echo "【SSR 服务】"
+    echo -e "${green}1.${plain} SSR 独立模式 - 单节点服务器"
+    echo -e "${green}2.${plain} SSR 面板模式 - 对接 SSRPanel 前端"
+    echo -e "${green}3.${plain} 卸载 SSR (独立模式)"
+    echo -e "${green}4.${plain} 卸载 SSR (面板模式)"
+    echo ""
+    echo "【IP盾构机】"
+    echo -e "${green}5.${plain} 落地机-全局初始化"
+    echo ""
+    echo -e "${green}0.${plain} 退出脚本"
+    echo ""
+    read -p "请输入选项 [0-5]: " choice
+
+    case "$choice" in
+        1) install_standalone ;;
+        2) install_panel ;;
+        3) uninstall_standalone ;;
+        4) uninstall_panel ;;
+        5) ip_landing_init ;;
+        0) exit 0 ;;
+        *) echo -e "${red}无效选项${plain}" && sleep 2 && show_menu ;;
+    esac
+}
+
+#=================================================================#
+#                        公共修复函数                              #
+#=================================================================#
+
+# 修复 OpenSSL 软链接（Ubuntu 24.04 OpenSSL 3.x 路径问题）
+fix_openssl(){
+    if [ ! -f /usr/lib/libcrypto.so.1.1 ]; then
+        LIBCRYPTO=$(find /usr/lib /usr/lib/x86_64-linux-gnu -name "libcrypto.so*" 2>/dev/null | head -n 1)
+        if [ -n "$LIBCRYPTO" ]; then
+            ln -sf "$LIBCRYPTO" /usr/lib/libcrypto.so.1.1
+            ldconfig
+            echo -e "${green}✓ OpenSSL 软链接已修复${plain}"
+        fi
+    fi
+}
+
+# 修复 Python 3.10+ collections 兼容性问题
+fix_collections(){
+    local target_dir=$1
+    echo -e "${cyan}修复 Python 3.10+ 兼容性...${plain}"
+    find "$target_dir" -name "*.py" | xargs grep -l "collections\.MutableMapping" 2>/dev/null | while read f; do
+        sed -i 's/collections\.MutableMapping/collections.abc.MutableMapping/g' "$f"
+        echo -e "${green}✓ 已修复: $f${plain}"
+    done
+    find "$target_dir" -name "*.py" | xargs grep -l "collections\.Callable" 2>/dev/null | while read f; do
+        sed -i 's/collections\.Callable/collections.abc.Callable/g' "$f"
+        echo -e "${green}✓ 已修复: $f${plain}"
+    done
+    find "$target_dir" -name "*.py" | xargs grep -l "collections\.Iterable" 2>/dev/null | while read f; do
+        sed -i 's/collections\.Iterable/collections.abc.Iterable/g' "$f"
+        echo -e "${green}✓ 已修复: $f${plain}"
+    done
+}
+
+#=================================================================#
+#                      IP盾构机部署函数                            #
+#=================================================================#
+
+ip_landing_init(){
+    echo -e "\n${cyan}=== 落地机初始化 ===${plain}\n"
+    echo -e "${yellow}注意: 请提前手动放行防火墙端口!${plain}\n"
+
+    echo -e "${cyan}安装依赖...${plain}"
+    if [[ -f /etc/redhat-release ]]; then
+        yum install -y wget curl ca-certificates
     else
-        echo -e "\033[33m⚠️ BBR 启用失败，请检查内核配置\033[0m"
+        apt-get update && apt-get install -y wget curl ca-certificates
     fi
-else
-    echo -e "\033[33m⚠️ 内核版本 $KERNEL_VERSION 不支持 BBR（需要 4.9+）\033[0m"
-    echo -e "\033[33m💡 建议升级内核以获得更好的网络性能\033[0m"
-fi
 
-# 强制启用 nf_conntrack 并设置最大连接数
-if lsmod | grep -q '^nf_conntrack'; then sysctl -w net.netfilter.nf_conntrack_max=1048576 && echo "net.netfilter.nf_conntrack_max=1048576" >> /etc/sysctl.conf && sysctl -p; else echo "⚠️ nf_conntrack 模块不存在，跳过 nf_conntrack_max 设置"; fi
+    read -p "是否下载被控端文件? (首次必须安装) [y/N]: " down_files_1
+    if [[ "$down_files_1" =~ ^[yY]$ ]]; then
+        echo -e "${cyan}下载 gost 2.11...${plain}"
+        wget -q --show-progress http://eltty.elttycn.com/gost -O /usr/bin/gost
+        chmod +x /usr/bin/gost
 
-# 文件句柄限制
-ulimit -n 1048576
-cat >> /etc/security/limits.conf <<EOF
-* soft nofile 1048576
-* hard nofile 1048576
+        echo -e "${cyan}下载被控端...${plain}"
+        wget -q --show-progress http://eltty.elttycn.com/iptables_gost -O /usr/bin/iptables_gost
+        chmod +x /usr/bin/iptables_gost
+
+        echo -e "${green}✓ 文件下载完成${plain}"
+    fi
+
+    echo ""
+    echo -e "${green}============================================${plain}"
+    echo -e "${green}✅ 落地机初始化完成!${plain}"
+    echo -e "${green}============================================${plain}"
+    echo ""
+    echo "重要提示:"
+    echo "1. 请手动执行 'crontab -e' 添加定时任务"
+    echo "2. 确保已放行必要的防火墙端口"
+    echo ""
+    echo "工具路径:"
+    echo "  /usr/bin/gost"
+    echo "  /usr/bin/iptables_gost"
+    echo ""
+
+    read -p "按 Enter 返回主菜单..." && show_menu
+}
+
+#=================================================================#
+#                      SSR独立模式部署函数                         #
+#=================================================================#
+
+libsodium_file="libsodium-1.0.18"
+libsodium_url="https://github.com/jedisct1/libsodium/releases/download/1.0.18-RELEASE/libsodium-1.0.18.tar.gz"
+shadowsocks_r_file="shadowsocksr-3.2.2"
+shadowsocks_r_url="https://github.com/shadowsocksrr/shadowsocksr/archive/3.2.2.tar.gz"
+
+cur_dir=`pwd`
+
+ciphers=(none aes-256-cfb aes-192-cfb aes-128-cfb aes-256-cfb8 aes-192-cfb8 aes-128-cfb8 aes-256-ctr aes-192-ctr aes-128-ctr chacha20-ietf chacha20 salsa20 xchacha20 xsalsa20 rc4-md5)
+protocols=(origin verify_deflate auth_sha1_v4 auth_sha1_v4_compatible auth_aes128_md5 auth_aes128_sha1 auth_chain_a auth_chain_b auth_chain_c auth_chain_d auth_chain_e auth_chain_f)
+obfs=(plain http_simple http_simple_compatible http_post http_post_compatible tls1.2_ticket_auth tls1.2_ticket_auth_compatible tls1.2_ticket_fastauth tls1.2_ticket_fastauth_compatible)
+
+get_ip(){
+    local IP=$( ip addr | egrep -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | egrep -v "^192\.168|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-2]\.|^10\.|^127\.|^255\.|^0\." | head -n 1 )
+    [ -z ${IP} ] && IP=$( curl -s ifconfig.me 2>/dev/null )
+    [ -z ${IP} ] && IP=$( curl -s ipinfo.io/ip 2>/dev/null )
+    [ ! -z ${IP} ] && echo ${IP} || echo
+}
+
+pre_install_standalone(){
+    echo -e "\n${cyan}=== SSR 独立模式配置 ===${plain}\n"
+
+    read -p "请输入 SSR 密码 (默认: teddysun.com): " shadowsockspwd
+    [ -z "$shadowsockspwd" ] && shadowsockspwd="teddysun.com"
+    shadowsockspwd=$(echo "$shadowsockspwd" | xargs)
+
+    dport=$(shuf -i 9000-19999 -n 1)
+    read -p "请输入端口 [1-65535] (默认: ${dport}): " shadowsocksport
+    [ -z "${shadowsocksport}" ] && shadowsocksport=${dport}
+
+    echo -e "\n请选择加密方式:"
+    for ((i=1;i<=${#ciphers[@]};i++ )); do
+        echo -e "${green}${i})${plain} ${ciphers[$i-1]}"
+    done
+    read -p "选择 (默认: 2): " pick
+    [ -z "$pick" ] && pick=2
+    shadowsockscipher=${ciphers[$pick-1]}
+
+    echo -e "\n请选择协议:"
+    for ((i=1;i<=${#protocols[@]};i++ )); do
+        echo -e "${green}${i})${plain} ${protocols[$i-1]}"
+    done
+    read -p "选择 (默认: 1): " protocol
+    [ -z "$protocol" ] && protocol=1
+    shadowsockprotocol=${protocols[$protocol-1]}
+
+    echo -e "\n请选择混淆:"
+    for ((i=1;i<=${#obfs[@]};i++ )); do
+        echo -e "${green}${i})${plain} ${obfs[$i-1]}"
+    done
+    read -p "选择 (默认: 1): " r_obfs
+    [ -z "$r_obfs" ] && r_obfs=1
+    shadowsockobfs=${obfs[$r_obfs-1]}
+
+    echo -e "\n${cyan}配置确认:${plain}"
+    echo "密码: ${shadowsockspwd}"
+    echo "端口: ${shadowsocksport}"
+    echo "加密: ${shadowsockscipher}"
+    echo "协议: ${shadowsockprotocol}"
+    echo "混淆: ${shadowsockobfs}"
+    echo ""
+    read -p "按 Enter 开始安装..."
+}
+
+install_deps_standalone(){
+    echo -e "\n${cyan}安装依赖...${plain}"
+    if [[ -f /etc/redhat-release ]]; then
+        yum install -y python3 python3-devel python3-setuptools openssl openssl-devel \
+            curl wget unzip gcc automake autoconf make libtool libsodium-devel
+    else
+        apt-get -y update
+        apt-get -y install python3 python3-dev python3-setuptools openssl libssl-dev \
+            curl wget unzip gcc automake autoconf make libtool libsodium-dev
+    fi
+}
+
+download_files_standalone(){
+    cd ${cur_dir}
+
+    if [ ! -f "/usr/lib/libsodium.a" ] && [ ! -f "/usr/local/lib/libsodium.a" ]; then
+        echo "下载 libsodium..."
+        wget --no-check-certificate -O ${libsodium_file}.tar.gz ${libsodium_url} || exit 1
+    fi
+
+    echo "下载 SSR..."
+    wget --no-check-certificate -O ${shadowsocks_r_file}.tar.gz ${shadowsocks_r_url} || exit 1
+}
+
+config_shadowsocks_standalone(){
+    cat > /etc/shadowsocks.json<<-EOF
+{
+    "server":"0.0.0.0",
+    "server_ipv6":"[::]",
+    "server_port":${shadowsocksport},
+    "local_address":"127.0.0.1",
+    "local_port":1080,
+    "password":"${shadowsockspwd}",
+    "timeout":120,
+    "method":"${shadowsockscipher}",
+    "protocol":"${shadowsockprotocol}",
+    "protocol_param":"",
+    "obfs":"${shadowsockobfs}",
+    "obfs_param":"",
+    "redirect":"",
+    "dns_ipv6":false,
+    "fast_open":false,
+    "workers":1
+}
 EOF
+}
 
-# TCP 内核参数
-cat >> /etc/sysctl.conf <<EOF
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65000
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.ip_forward = 1
-EOF
-sysctl -p
+install_ssr_standalone(){
+    if [ ! -f "/usr/lib/libsodium.a" ] && [ ! -f "/usr/local/lib/libsodium.a" ]; then
+        cd ${cur_dir}
+        tar zxf ${libsodium_file}.tar.gz
+        cd ${libsodium_file}
+        ./configure --prefix=/usr && make && make install || exit 1
+    fi
 
-# ========================
-# 部署 SSRPanel 后端
-# ========================
-echo -e "\033[33m⚙️ 部署 SSRPanel 后端...\033[0m"
-cd /home
-if [ ! -d "$SSR_HOME" ]; then
-    git clone https://github.com/gxz2018/shadowsocksr-backup.git shadowsocksr
-fi
-cd $SSR_HOME
-bash setup_cymysql.sh
-bash initcfg.sh
+    ldconfig
+    fix_openssl
 
-# 配置数据库与节点
-sed -i 's/sspanelv2/glzjinmod/g' userapiconfig.py
-sed -i "s/127.0.0.1/$mysqla/g" usermysql.json
-sed -i "s/\"user\": \"ss\"/\"user\": \"$mysqlu\"/g" usermysql.json
-sed -i "s/\"password\": \"pass\"/\"password\": \"$mysqlp\"/g" usermysql.json
-sed -i "s/\"db\": \"sspanel\"/\"db\": \"$mysqld\"/g" usermysql.json
-sed -i "s/\"node_id\": 0/\"node_id\": $node/g" usermysql.json
+    cd ${cur_dir}
+    tar zxf ${shadowsocks_r_file}.tar.gz
+    mv ${shadowsocks_r_file}/shadowsocks /usr/local/
 
-# systemd 高并发 + 自动重启
-cat > /etc/systemd/system/ssrpanel.service <<EOF
+    # 修复 Python 3.10+ 兼容性
+    fix_collections /usr/local/shadowsocks
+
+    if [ -f /usr/local/shadowsocks/server.py ]; then
+        cat > /etc/systemd/system/shadowsocks-standalone.service <<EOF
 [Unit]
-Description=SSRPanel 后端服务（高并发 + 自动重启）
-After=network.target mysql.service
+Description=ShadowsocksR Server (Standalone)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/shadowsocksr/server.py
-WorkingDirectory=/home/shadowsocksr
-Restart=always
-RestartSec=5
-LimitNOFILE=1048576
-StandardOutput=null
-StandardError=null
 User=root
+ExecStart=/usr/bin/python3 /usr/local/shadowsocks/server.py -c /etc/shadowsocks.json
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable ssrpanel.service
-systemctl restart ssrpanel.service
+        systemctl daemon-reload
+        systemctl enable shadowsocks-standalone
+        systemctl start shadowsocks-standalone
+        sleep 2
 
-# ========================
-# 部署 Teddysun SSR
-# ========================
-echo -e "\033[33m⚙️ 部署 Teddysun SSR...\033[0m"
-cd /root
-wget --no-check-certificate -O shadowsocks-all.sh https://raw.githubusercontent.com/teddysun/shadowsocks_install/master/shadowsocks-all.sh
-sed -i "s/DEFAULT_PORT=.*/DEFAULT_PORT=${SSR_TEDDYSUN_PORT}/" shadowsocks-all.sh
-sed -i "s/DEFAULT_PASS=.*/DEFAULT_PASS=${SSR_TEDDYSUN_PASS}/" shadowsocks-all.sh
-chmod +x shadowsocks-all.sh
-./shadowsocks-all.sh 2>&1 | tee shadowsocks-all.log
-
-# ========================
-# 智能 SSR 守护脚本（优化版）
-# ========================
-echo -e "\033[33m🛡️ 部署智能守护（优化版）...\033[0m"
-cat > /usr/local/bin/ssr_guard.sh <<'EOF'
-#!/bin/bash
-# =========================================================
-# 🛡️ SSR 智能守护脚本（优化版）
-# =========================================================
-
-LOG="/var/log/ssr_guard.log"
-SERVICE="/etc/init.d/shadowsocks"
-LOCK_FILE="/var/run/ssr_guard.lock"
-MAX_LOG_SIZE=10485760  # 10MB
-
-# 配置参数
-CHECK_INTERVAL=10       # 检查间隔（秒）
-MAX_RESTART_COUNT=3     # 最大连续重启次数
-RESTART_WINDOW=60       # 重启计数窗口（秒）
-COOLDOWN_TIME=300       # 冷却时间（秒）
-PROCESS_CHECK_TIMEOUT=3 # 进程检查超时（秒）
-
-# 状态变量
-RESTART_TIMES=()
-IS_COOLDOWN=false
-
-# ========================
-# 日志管理
-# ========================
-log_message() {
-    local level="$1"
-    local message="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$LOG"
-    
-    # 日志轮转
-    if [ -f "$LOG" ]; then
-        local log_size=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || echo 0)
-        if [ "$log_size" -gt $MAX_LOG_SIZE ]; then
-            mv "$LOG" "${LOG}.old"
-            log_message "INFO" "日志文件已轮转"
-        fi
-    fi
-}
-
-# ========================
-# 锁机制（防止多实例）
-# ========================
-acquire_lock() {
-    if [ -f "$LOCK_FILE" ]; then
-        local pid=$(cat "$LOCK_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            log_message "ERROR" "守护进程已在运行 (PID: $pid)"
+        if systemctl is-active --quiet shadowsocks-standalone; then
+            clear
+            echo -e "${green}✅ SSR 独立模式部署成功!${plain}\n"
+            echo "=========================================="
+            echo -e "服务器 IP: ${cyan}$(get_ip)${plain}"
+            echo -e "端口: ${cyan}${shadowsocksport}${plain}"
+            echo -e "密码: ${cyan}${shadowsockspwd}${plain}"
+            echo -e "协议: ${cyan}${shadowsockprotocol}${plain}"
+            echo -e "混淆: ${cyan}${shadowsockobfs}${plain}"
+            echo -e "加密: ${cyan}${shadowsockscipher}${plain}"
+            echo "=========================================="
+            echo -e "\n常用命令:"
+            echo "  systemctl start shadowsocks-standalone"
+            echo "  systemctl stop shadowsocks-standalone"
+            echo "  systemctl restart shadowsocks-standalone"
+            echo "  systemctl status shadowsocks-standalone"
+            echo "  journalctl -u shadowsocks-standalone -f"
+            echo ""
+        else
+            echo -e "${red}启动失败，请查看日志: journalctl -u shadowsocks-standalone${plain}"
             exit 1
-        else
-            log_message "WARN" "清理过期锁文件 (PID: $pid)"
-            rm -f "$LOCK_FILE"
         fi
-    fi
-    echo $$ > "$LOCK_FILE"
-}
-
-release_lock() {
-    rm -f "$LOCK_FILE"
-}
-
-# ========================
-# 精确的进程检查
-# ========================
-check_ssr_process() {
-    # 使用更精确的进程匹配，避免误报
-    timeout $PROCESS_CHECK_TIMEOUT pgrep -f "python.*ssserver" > /dev/null 2>&1
-    return $?
-}
-
-# ========================
-# 端口监听检查（双重验证）
-# ========================
-check_ssr_port() {
-    # 检查 SSR 是否真正在监听端口
-    if command -v netstat >/dev/null 2>&1; then
-        netstat -tuln | grep -q ":.*LISTEN" && return 0
-    elif command -v ss >/dev/null 2>&1; then
-        ss -tuln | grep -q "LISTEN" && return 0
-    fi
-    return 1
-}
-
-# ========================
-# 重启频率控制
-# ========================
-should_restart() {
-    local current_time=$(date +%s)
-    
-    # 清理过期的重启记录
-    local temp_times=()
-    for time in "${RESTART_TIMES[@]}"; do
-        if [ $((current_time - time)) -lt $RESTART_WINDOW ]; then
-            temp_times+=("$time")
-        fi
-    done
-    RESTART_TIMES=("${temp_times[@]}")
-    
-    # 检查是否处于冷却期
-    if [ "$IS_COOLDOWN" = true ]; then
-        local last_restart=${RESTART_TIMES[-1]:-0}
-        if [ $((current_time - last_restart)) -gt $COOLDOWN_TIME ]; then
-            IS_COOLDOWN=false
-            RESTART_TIMES=()
-            log_message "INFO" "冷却期结束，重置计数器"
-        else
-            return 1
-        fi
-    fi
-    
-    # 检查重启频率
-    if [ ${#RESTART_TIMES[@]} -ge $MAX_RESTART_COUNT ]; then
-        IS_COOLDOWN=true
-        log_message "WARN" "重启过于频繁，进入 ${COOLDOWN_TIME}s 冷却期"
-        return 1
-    fi
-    
-    return 0
-}
-
-# ========================
-# SSR 重启逻辑
-# ========================
-restart_ssr() {
-    log_message "WARN" "检测到 SSR 服务异常，准备重启..."
-    
-    # 记录重启时间
-    RESTART_TIMES+=($(date +%s))
-    
-    # 尝试优雅停止
-    if [ -f "$SERVICE" ]; then
-        log_message "INFO" "执行优雅停止..."
-        timeout 10 $SERVICE stop >> "$LOG" 2>&1 || {
-            log_message "WARN" "优雅停止超时，强制终止进程"
-            pkill -9 -f "python.*ssserver"
-        }
-    fi
-    
-    sleep 2
-    
-    # 启动服务
-    log_message "INFO" "正在启动 SSR 服务..."
-    $SERVICE start >> "$LOG" 2>&1
-    
-    sleep 3
-    
-    # 验证启动结果
-    if check_ssr_process && check_ssr_port; then
-        log_message "INFO" "✅ SSR 服务重启成功"
-        return 0
     else
-        log_message "ERROR" "❌ SSR 服务重启失败"
-        return 1
+        echo -e "${red}安装失败${plain}"
+        exit 1
+    fi
+
+    rm -rf ${shadowsocks_r_file}.tar.gz ${shadowsocks_r_file} ${libsodium_file}.tar.gz ${libsodium_file}
+}
+
+install_standalone(){
+    pre_install_standalone
+    install_deps_standalone
+    download_files_standalone
+    config_shadowsocks_standalone
+    install_ssr_standalone
+    read -p "按 Enter 返回主菜单..." && show_menu
+}
+
+uninstall_standalone(){
+    echo -e "\n${yellow}确定要卸载 SSR 独立模式吗? (y/n)${plain}"
+    read -p "(默认: n): " answer
+    [ -z ${answer} ] && answer="n"
+
+    if [ "${answer}" == "y" ] || [ "${answer}" == "Y" ]; then
+        systemctl stop shadowsocks-standalone 2>/dev/null
+        systemctl disable shadowsocks-standalone 2>/dev/null
+        rm -f /etc/shadowsocks.json
+        rm -f /etc/systemd/system/shadowsocks-standalone.service
+        rm -rf /usr/local/shadowsocks
+        systemctl daemon-reload
+        echo -e "${green}✅ 卸载成功${plain}"
+    else
+        echo -e "${yellow}已取消${plain}"
+    fi
+
+    read -p "按 Enter 返回主菜单..." && show_menu
+}
+
+#=================================================================#
+#                      SSR面板模式部署函数                         #
+#=================================================================#
+
+pre_install_panel(){
+    echo -e "\n${cyan}=== SSR 面板模式配置 ===${plain}\n"
+
+    read -p "MySQL 地址 (如 127.0.0.1): " mysqla
+    read -p "MySQL 用户名: " mysqlu
+    read -p "MySQL 密码: " mysqlp
+    read -p "MySQL 数据库名: " mysqld
+    read -p "节点 ID: " node
+
+    echo -e "\n${cyan}配置确认:${plain}"
+    echo "数据库: ${mysqla}/${mysqld}"
+    echo "用户: ${mysqlu}"
+    echo "节点 ID: ${node}"
+    echo ""
+    read -p "按 Enter 开始安装..."
+}
+
+install_deps_panel(){
+    echo -e "\n${cyan}安装依赖...${plain}"
+    apt-get update -y
+    apt-get install -y git python3 python3-pip net-tools build-essential \
+        iptables supervisor curl libffi-dev libsodium-dev openssl libssl-dev
+}
+
+setup_firewall(){
+    echo -e "\n${cyan}配置防火墙...${plain}"
+    iptables -F
+    iptables -I INPUT -p tcp --dport 22:65535 -j ACCEPT
+    iptables -I INPUT -p udp --dport 22:65535 -j ACCEPT
+
+    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+
+    if ! dpkg -l | grep -q iptables-persistent; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+    else
+        netfilter-persistent save
     fi
 }
 
-# ========================
-# 信号处理
-# ========================
-cleanup() {
-    log_message "INFO" "守护进程收到终止信号，正在退出..."
-    release_lock
-    exit 0
-}
+setup_bbr(){
+    echo -e "\n${cyan}启用 BBR 加速...${plain}"
+    kernel_version=$(uname -r | cut -d. -f1)
 
-trap cleanup SIGTERM SIGINT
+    if [ "$kernel_version" -ge 4 ]; then
+        modprobe tcp_bbr
 
-# ========================
-# 主循环
-# ========================
-main() {
-    acquire_lock
-    log_message "INFO" "🛡️ SSR 智能守护服务启动 (PID: $$)"
-    log_message "INFO" "配置: 检查间隔=${CHECK_INTERVAL}s, 重启窗口=${RESTART_WINDOW}s, 最大重启=${MAX_RESTART_COUNT}次"
-    
-    while true; do
-        # 检查进程和端口
-        if ! check_ssr_process; then
-            log_message "WARN" "⚠️ SSR 进程未运行"
-            
-            if should_restart; then
-                restart_ssr
-            else
-                log_message "WARN" "⏸️ 处于冷却期，跳过重启"
-            fi
-        elif ! check_ssr_port; then
-            log_message "WARN" "⚠️ SSR 进程存在但未监听端口"
-            
-            if should_restart; then
-                restart_ssr
-            fi
+        if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+            cat >> /etc/sysctl.conf <<EOF
+
+# BBR 加速配置
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
         fi
-        
-        # 动态调整检查间隔
-        if [ "$IS_COOLDOWN" = true ]; then
-            sleep 30  # 冷却期降低检查频率
+
+        sysctl -p
+
+        if lsmod | grep -q bbr && sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
+            echo -e "${green}✓ BBR 已启用${plain}"
         else
-            sleep $CHECK_INTERVAL
+            echo -e "${yellow}⚠ BBR 启用可能失败${plain}"
         fi
-    done
+    else
+        echo -e "${yellow}⚠ 内核版本过低 (需要 4.9+)${plain}"
+    fi
 }
 
-# 启动守护
-main
+install_python_deps(){
+    echo -e "\n${cyan}安装 Python 依赖...${plain}"
+    # Ubuntu 24.04 受 PEP 668 保护，需加 --break-system-packages
+    pip3 install --upgrade pip --break-system-packages 2>/dev/null || pip3 install --upgrade pip
+    pip3 install cymysql pycryptodome --break-system-packages 2>/dev/null || pip3 install cymysql pycryptodome
+}
+
+clone_ssr_panel(){
+    echo -e "\n${cyan}克隆 SSR 后端代码...${plain}"
+    cd /home
+
+    if [ -d "shadowsocksr" ]; then
+        echo -e "${yellow}检测到已存在目录${plain}"
+        read -p "是否删除并重新克隆? (y/n): " choice
+        case "$choice" in
+            y|Y )
+                rm -rf shadowsocksr
+                git clone https://github.com/gxz2018/shadowsocksr-backup.git shadowsocksr
+                ;;
+            * )
+                echo "保留现有目录"
+                ;;
+        esac
+    else
+        git clone https://github.com/gxz2018/shadowsocksr-backup.git shadowsocksr
+    fi
+
+    cd shadowsocksr
+    bash setup_cymysql.sh
+    bash initcfg.sh
+}
+
+config_ssr_panel(){
+    echo -e "\n${cyan}配置数据库连接...${plain}"
+
+    sed -i 's/sspanelv2/glzjinmod/g' userapiconfig.py
+    sed -i "s/127.0.0.1/$mysqla/g" usermysql.json
+    sed -i "s/\"user\": \"ss\"/\"user\": \"$mysqlu\"/g" usermysql.json
+    sed -i "s/\"password\": \"pass\"/\"password\": \"$mysqlp\"/g" usermysql.json
+    sed -i "s/\"db\": \"sspanel\"/\"db\": \"$mysqld\"/g" usermysql.json
+    sed -i "s/\"node_id\": 0/\"node_id\": $node/g" usermysql.json
+
+    # 修复 Python 3.10+ 兼容性
+    fix_collections /home/shadowsocksr
+}
+
+setup_supervisor(){
+    echo -e "\n${cyan}配置 Supervisor...${plain}"
+
+    SUPERVISOR_CONF_DIR="/etc/supervisor/conf.d"
+    SUPERVISOR_MAIN_CONF="/etc/supervisor/supervisord.conf"
+
+    mkdir -p "$SUPERVISOR_CONF_DIR"
+    mkdir -p /var/log/supervisor
+
+    if [ -f "$SUPERVISOR_MAIN_CONF" ]; then
+        if ! grep -q "\[include\]" "$SUPERVISOR_MAIN_CONF"; then
+            cat >> "$SUPERVISOR_MAIN_CONF" <<EOF
+
+[include]
+files = /etc/supervisor/conf.d/*.conf
+EOF
+        fi
+    fi
+
+    cat > "$SUPERVISOR_CONF_DIR/ssr.conf" <<EOF
+[program:ssr]
+command=python3 /home/shadowsocksr/server.py
+directory=/home/shadowsocksr
+autostart=true
+autorestart=true
+user=root
+stdout_logfile=/var/log/supervisor/ssr.log
+stdout_logfile_maxbytes=50MB
+stdout_logfile_backups=2
+stderr_logfile=/var/log/supervisor/ssr_error.log
+stderr_logfile_maxbytes=50MB
+stderr_logfile_backups=2
+startsecs=5
+stopwaitsecs=10
+priority=999
+EOF
+}
+
+setup_log_cleanup(){
+    echo -e "\n${cyan}配置日志清理...${plain}"
+
+    cat > /usr/local/bin/cleanup-ssr-logs.sh <<'EOF'
+#!/bin/bash
+find /var/log/supervisor -name "ssr*.log.*" -mtime +7 -delete
+find /var/log/supervisor -name "ssr*_error.log.*" -mtime +7 -delete
 EOF
 
-chmod +x /usr/local/bin/ssr_guard.sh
+    chmod +x /usr/local/bin/cleanup-ssr-logs.sh
 
-# systemd 服务守护
-cat > /etc/systemd/system/ssr-guard.service <<EOF
+    if ! crontab -l 2>/dev/null | grep -q "cleanup-ssr-logs"; then
+        (crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/bin/cleanup-ssr-logs.sh >/dev/null 2>&1") | crontab -
+        echo -e "${green}✓ 已配置每日自动清理${plain}"
+    fi
+}
+
+start_supervisor(){
+    echo -e "\n${cyan}启动 Supervisor...${plain}"
+
+    supervisorctl stop all 2>/dev/null || true
+    systemctl stop supervisor 2>/dev/null || true
+
+    cat > /etc/systemd/system/supervisor.service <<EOF
 [Unit]
-Description=SSR 智能守护服务
+Description=Supervisor process control system
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/ssr_guard.sh
-Restart=always
-RestartSec=5
-User=root
+Type=forking
+ExecStart=/usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+ExecStop=/usr/bin/supervisorctl shutdown
+ExecReload=/usr/bin/supervisorctl reload
+KillMode=process
+Restart=on-failure
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable ssr-guard.service
-systemctl start ssr-guard.service
+    systemctl daemon-reload
+    systemctl enable supervisor
+    systemctl start supervisor
+    sleep 3
 
-# ========================
-# 防火墙规则
-# ========================
-echo -e "\033[33m🔥 配置防火墙规则...\033[0m"
+    supervisorctl reread
+    supervisorctl update
+    supervisorctl start ssr
+    sleep 2
+}
 
-# 保留 SSH 端口(防止被锁)
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+install_panel(){
+    pre_install_panel
+    install_deps_panel
+    setup_firewall
+    setup_bbr
+    install_python_deps
+    clone_ssr_panel
+    fix_openssl
+    config_ssr_panel
+    setup_supervisor
+    setup_log_cleanup
+    start_supervisor
 
-# 允许已建立的连接
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    clear
+    echo -e "${green}✅ SSR 面板模式部署成功!${plain}\n"
+    echo "=========================================="
+    echo "配置文件: /home/shadowsocksr/usermysql.json"
+    echo "Supervisor 配置: /etc/supervisor/conf.d/ssr.conf"
+    echo ""
+    echo "常用命令:"
+    echo "  supervisorctl status ssr"
+    echo "  supervisorctl restart ssr"
+    echo "  tail -f /var/log/supervisor/ssr.log"
+    echo ""
+    echo "日志管理:"
+    echo "  单个日志最大: 50MB"
+    echo "  保留备份: 2个"
+    echo "  自动清理: 每天凌晨3点删除7天前日志"
+    echo "  手动清理: /usr/local/bin/cleanup-ssr-logs.sh"
+    echo "=========================================="
 
-# 允许本地回环
-iptables -A INPUT -i lo -j ACCEPT
+    read -p "按 Enter 返回主菜单..." && show_menu
+}
 
-# SSR 端口规则
-iptables -A INPUT -p tcp --dport $SSR_PANEL_PORT -j ACCEPT
-iptables -A INPUT -p udp --dport $SSR_PANEL_PORT -j ACCEPT
-iptables -A INPUT -p tcp --dport $SSR_TEDDYSUN_PORT -j ACCEPT
-iptables -A INPUT -p udp --dport $SSR_TEDDYSUN_PORT -j ACCEPT
+uninstall_panel(){
+    echo -e "\n${yellow}确定要卸载 SSR 面板模式吗? (y/n)${plain}"
+    read -p "(默认: n): " answer
+    [ -z ${answer} ] && answer="n"
 
-# 保存规则
-iptables-save > /etc/iptables.rules
+    if [ "${answer}" == "y" ] || [ "${answer}" == "Y" ]; then
+        supervisorctl stop ssr 2>/dev/null
+        systemctl stop supervisor 2>/dev/null
+        systemctl disable supervisor 2>/dev/null
+        rm -f /etc/supervisor/conf.d/ssr.conf
+        rm -rf /home/shadowsocksr
+        rm -f /usr/local/bin/cleanup-ssr-logs.sh
+        crontab -l 2>/dev/null | grep -v "cleanup-ssr-logs" | crontab -
+        echo -e "${green}✅ 卸载成功${plain}"
+    else
+        echo -e "${yellow}已取消${plain}"
+    fi
 
-# 根据系统选择持久化方法
-if [ -d /etc/network/if-pre-up.d ]; then
-    # 传统 Debian/Ubuntu 系统
-    cat > /etc/network/if-pre-up.d/iptables <<'EOFF'
-#!/bin/sh
-iptables-restore < /etc/iptables.rules
-EOFF
-    chmod +x /etc/network/if-pre-up.d/iptables
-elif command -v systemctl &> /dev/null; then
-    # systemd 系统
-    cat > /etc/systemd/system/iptables-restore.service <<'EOFF'
-[Unit]
-Description=Restore iptables rules
-Before=network-pre.target
+    read -p "按 Enter 返回主菜单..." && show_menu
+}
 
-[Service]
-Type=oneshot
-ExecStart=/sbin/iptables-restore /etc/iptables.rules
+#=================================================================#
+#                           主程序入口                             #
+#=================================================================#
 
-[Install]
-WantedBy=multi-user.target
-EOFF
-    systemctl enable iptables-restore.service
-fi
-
-# ========================
-# 部署完成
-# ========================
-echo ""
-echo -e "\033[32m================================================\033[0m"
-echo -e "\033[32m✅ 部署完成！\033[0m"
-echo -e "\033[32m================================================\033[0m"
-echo ""
-echo -e "\033[33m📋 服务管理命令：\033[0m"
-echo "  SSRPanel 服务:     systemctl status ssrpanel"
-echo "  Teddysun SSR 服务: /etc/init.d/shadowsocks status"
-echo "  智能守护服务:      systemctl status ssr-guard"
-echo ""
-echo -e "\033[33m📊 日志查看：\033[0m"
-echo "  守护日志: tail -f /var/log/ssr_guard.log"
-echo "  SSRPanel: journalctl -u ssrpanel -f"
-echo ""
-echo -e "\033[33m🔧 配置信息：\033[0m"
-echo "  节点 ID: $node"
-echo "  SSR Panel 端口: $SSR_PANEL_PORT"
-echo "  Teddysun SSR 端口: $SSR_TEDDYSUN_PORT"
-echo ""
-echo -e "\033[33m🚀 BBR 状态：\033[0m"
-if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-    echo -e "  \033[32m✅ BBR 加速已启用\033[0m"
-else
-    echo -e "  \033[31m❌ BBR 未启用（内核版本过低或配置失败）\033[0m"
-fi
-echo ""
-echo -e "\033[36m🛡️ 智能守护已启用（自动重启 + 频率控制 + 冷却机制）\033[0m"
-echo ""
+show_menu
