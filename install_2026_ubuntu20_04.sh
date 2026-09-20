@@ -1,8 +1,8 @@
 #!/bin/bash
 #=================================================================#
 #   SSR + IP盾构机一键部署脚本                                     #
-#   适配 Debian 11 / Ubuntu 20.04 / 22.04   
-#   26.09.19
+#   适配 Debian 11 / Ubuntu 20.04 / 22.04 
+#   26.09.20.08.00
 #=================================================================#
 
 red='\033[0;31m'
@@ -58,22 +58,16 @@ get_ip(){
     echo "${IP:-未知}"
 }
 
-#=================================================================#
-# 修复 openssl.py
-# 关键：用独立 Python 文件 + sys.argv 传参，彻底避免 heredoc 嵌套
-#=================================================================#
 fix_python310_compat(){
     local ssr_dir="$1"
-    echo -e "${cyan}修复 Python 3.10+ 兼容性...${plain}"
+    echo -e "${cyan}修复 Python 兼容性...${plain}"
 
-    # 修复 collections.MutableMapping
     grep -rl "collections\.MutableMapping" "$ssr_dir" 2>/dev/null \
         | xargs sed -i 's/collections\.MutableMapping/collections.abc.MutableMapping/g'
 
     local openssl_py="$ssr_dir/shadowsocks/crypto/openssl.py"
     [ -f "$openssl_py" ] || return
 
-    # 检测系统 libcrypto 版本
     local libcrypto_so
     libcrypto_so=$(ldconfig -p 2>/dev/null \
         | grep "libcrypto\.so\." \
@@ -81,7 +75,6 @@ fix_python310_compat(){
         | head -1)
     libcrypto_so=$(basename "${libcrypto_so:-libcrypto.so}")
 
-    # 写独立 Python 修复脚本（单引号 heredoc，bash 不展开任何变量）
     cat > /tmp/_fix_openssl.py << 'PYEOF'
 import sys
 
@@ -91,7 +84,6 @@ libcrypto_so = sys.argv[2]
 with open(path) as f:
     lines = f.readlines()
 
-# 找到 EVP_get_cipherbyname.restype 行，保留它及之后所有内容
 start = 0
 for i, line in enumerate(lines):
     if 'EVP_get_cipherbyname.restype' in line:
@@ -100,7 +92,6 @@ for i, line in enumerate(lines):
 
 tail = ''.join(lines[start:])
 
-# 重写整个文件头部，干净无污染
 header = (
     '#!/usr/bin/env python\n'
     '# -*- coding: utf-8 -*-\n'
@@ -116,9 +107,10 @@ header = (
     'buf_size = 2048\n'
     'loaded = False\n'
     'buf = None\n'
+    'ctx_cleanup = None\n'
     '\n'
     'def load_openssl():\n'
-    '    global loaded, libcrypto, buf\n'
+    '    global loaded, libcrypto, buf, ctx_cleanup\n'
     '    libcrypto = ctypes.CDLL("' + libcrypto_so + '")\n'
 )
 
@@ -128,16 +120,12 @@ with open(path, 'w') as f:
 print('openssl.py fixed, libcrypto =', libcrypto_so)
 PYEOF
 
-    # 通过 sys.argv 传参，和 bash 变量完全隔离
     python3 /tmp/_fix_openssl.py "$openssl_py" "$libcrypto_so"
     rm -f /tmp/_fix_openssl.py
 
     echo -e "${green}✓ Python 兼容性修复完成${plain}"
 }
 
-#=================================================================#
-#                           主菜单
-#=================================================================#
 show_menu(){
     check_system
     clear
@@ -170,9 +158,6 @@ show_menu(){
     esac
 }
 
-#=================================================================#
-#                        落地机
-#=================================================================#
 ip_landing_init(){
     echo -e "\n${cyan}=== 落地机初始化 ===${plain}\n"
     echo -e "${yellow}注意: 请提前手动放行防火墙端口!${plain}\n"
@@ -193,9 +178,6 @@ ip_landing_init(){
     read -p "按 Enter 返回主菜单..." && show_menu
 }
 
-#=================================================================#
-#                        SSR 独立模式
-#=================================================================#
 libsodium_file="libsodium-1.0.18"
 libsodium_url="https://github.com/jedisct1/libsodium/releases/download/1.0.18-RELEASE/libsodium-1.0.18.tar.gz"
 shadowsocks_r_url="https://github.com/shadowsocksrr/shadowsocksr/archive/3.2.2.tar.gz"
@@ -241,13 +223,11 @@ install_standalone(){
     echo -e "\n${cyan}确认: 密码=$shadowsockspwd 端口=$shadowsocksport 加密=$shadowsockscipher${plain}"
     read -p "按 Enter 开始安装..."
 
-    # 安装依赖
     DEBIAN_FRONTEND=noninteractive apt-get -y update
     DEBIAN_FRONTEND=noninteractive apt-get -y install \
         python3 python3-dev python3-setuptools python3-pip \
         openssl libssl-dev curl wget unzip gcc automake autoconf make libtool libsodium-dev
 
-    # 下载安装
     cd "${cur_dir}"
     if ! libsodium_installed; then
         wget --no-check-certificate -O "${libsodium_file}.tar.gz" "${libsodium_url}" || exit 1
@@ -262,10 +242,8 @@ install_standalone(){
     mv shadowsocksr-3.2.2/shadowsocks /usr/local/
     rm -rf shadowsocksr-3.2.2 ssr.tar.gz "${libsodium_file}.tar.gz" "${libsodium_file}"
 
-    # 修复 Python 兼容性
     fix_python310_compat "/usr/local"
 
-    # 写配置
     cat > /etc/shadowsocks.json << EOF
 {
     "server":"0.0.0.0",
@@ -287,7 +265,6 @@ install_standalone(){
 }
 EOF
 
-    # 写 systemd
     cat > /etc/systemd/system/shadowsocks-standalone.service << EOF
 [Unit]
 Description=ShadowsocksR Server (Standalone)
@@ -342,9 +319,6 @@ uninstall_standalone(){
     read -p "按 Enter 返回主菜单..." && show_menu
 }
 
-#=================================================================#
-#                        SSR 面板模式
-#=================================================================#
 install_panel(){
     echo -e "\n${cyan}=== SSR 面板模式 ===${plain}\n"
     echo "请确保已完成前端部署并知道节点 ID"
@@ -359,7 +333,6 @@ install_panel(){
     echo -e "\n${cyan}确认: ${mysqla}/${mysqld} 用户=${mysqlu} 节点=${node}${plain}"
     read -p "按 Enter 开始安装..."
 
-    # 安装依赖
     apt-get update -y
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         git python3 python3-pip python3-dev net-tools \
@@ -369,7 +342,6 @@ install_panel(){
     pip3_install --upgrade pip
     pip3_install cymysql==0.9.1 pycryptodome
 
-    # 防火墙
     iptables -F
     iptables -I INPUT -p tcp --dport 1:65535 -j ACCEPT
     iptables -I INPUT -p udp --dport 1:65535 -j ACCEPT
@@ -377,7 +349,6 @@ install_panel(){
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
     DEBIAN_FRONTEND=noninteractive netfilter-persistent save
 
-    # BBR
     local kernel_major kernel_minor
     kernel_major=$(uname -r | cut -d. -f1)
     kernel_minor=$(uname -r | cut -d. -f2 | cut -d- -f1)
@@ -392,18 +363,15 @@ EOF
         echo -e "${green}✓ BBR 已启用${plain}"
     fi
 
-    # 克隆 SSR
     cd /home
     [ -d "shadowsocksr" ] && rm -rf shadowsocksr
     git clone https://github.com/gxz2018/shadowsocksr-backup.git shadowsocksr
     cd shadowsocksr
     bash setup_cymysql.sh
     bash initcfg.sh
-    # 强制覆盖 setup_cymysql.sh 装的新版，用兼容 Python 3.8 的旧版
     rm -rf /home/shadowsocksr/cymysql
     pip3 install cymysql==0.9.1 --target /home/shadowsocksr/
 
-    # 写配置
     sed -i 's/sspanelv2/glzjinmod/g' userapiconfig.py
     sed -i "s/\"127.0.0.1\"/\"${mysqla}\"/g" usermysql.json
     sed -i "s/\"user\": \"ss\"/\"user\": \"${mysqlu}\"/g" usermysql.json
@@ -412,10 +380,8 @@ EOF
     sed -i "s/\"node_id\": 0/\"node_id\": ${node}/g" usermysql.json
     sed -i 's/"server": "127.0.0.1"/"server": "0.0.0.0"/g' user-config.json 2>/dev/null || true
 
-    # 修复 Python 兼容性
     fix_python310_compat "/home/shadowsocksr"
 
-    # Supervisor 配置
     mkdir -p /etc/supervisor/conf.d /var/log/supervisor
     grep -q "\[include\]" /etc/supervisor/supervisord.conf 2>/dev/null || \
         echo -e "\n[include]\nfiles = /etc/supervisor/conf.d/*.conf" >> /etc/supervisor/supervisord.conf
@@ -437,7 +403,6 @@ startsecs=5
 stopwaitsecs=10
 EOF
 
-    # systemd supervisor 单元
     cat > /etc/systemd/system/supervisor.service << EOF
 [Unit]
 Description=Supervisor process control system
@@ -465,7 +430,6 @@ EOF
     supervisorctl start ssr 2>/dev/null || true
     sleep 3
 
-    # 日志清理
     cat > /usr/local/bin/cleanup-ssr-logs.sh << 'EOF'
 #!/bin/bash
 find /var/log/supervisor -name "ssr*.log.*" -mtime +7 -delete
@@ -504,5 +468,4 @@ uninstall_panel(){
     read -p "按 Enter 返回主菜单..." && show_menu
 }
 
-#=================================================================#
 show_menu
